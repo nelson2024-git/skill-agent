@@ -9,7 +9,7 @@
  */
 
 import { Agent } from "@mariozechner/pi-agent-core";
-import { getModel, streamSimple, getModels, registerBuiltInApiProviders } from "@mariozechner/pi-ai";
+import { getModel, streamSimple, getModels, registerBuiltInApiProviders, getEnvApiKey } from "@mariozechner/pi-ai";
 import { loadSkills, type SkillDefinition } from "./skill-loader.js";
 import { Scheduler } from "./scheduler.js";
 import { readFileSync, existsSync } from "fs";
@@ -29,13 +29,60 @@ function loadDotEnv(): void {
     if (eqIdx === -1) continue;
     const key = trimmed.substring(0, eqIdx).trim();
     const val = trimmed.substring(eqIdx + 1).trim();
-    // 仅设置未定义的环境变量（不覆盖已有的）
-    if (!process.env[key]) {
-      process.env[key] = val;
-    }
+    if (!process.env[key]) process.env[key] = val;
   }
 }
 loadDotEnv();
+
+// ============================================================
+// Copilot Token 交换：PAT → Copilot OAuth Token
+// ============================================================
+let cachedCopilotToken: string | null = null;
+let copilotTokenExpiry = 0;
+
+async function exchangeCopilotToken(): Promise<string> {
+  // 如果已有有效 token，直接返回
+  const now = Math.floor(Date.now() / 1000);
+  if (cachedCopilotToken && copilotTokenExpiry > now + 60) {
+    return cachedCopilotToken;
+  }
+
+  // 获取 PAT / GitHub Token
+  const pat = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || process.env.COPILOT_GITHUB_TOKEN;
+  if (!pat) throw new Error("未设置 GitHub Token");
+
+  // 如果已经是 gho_ 开头（Copilot OAuth Token），直接使用
+  if (pat.startsWith("gho_")) {
+    cachedCopilotToken = pat;
+    return pat;
+  }
+
+  // 用 PAT 换取 Copilot OAuth Token
+  console.log("[Copilot] 正在用 GitHub PAT 换取 Copilot OAuth Token...");
+  const resp = await fetch("https://api.github.com/copilot_internal/v2/token", {
+    headers: {
+      "Authorization": `token ${pat}`,
+      "Accept": "application/json",
+      "User-Agent": "skill-agent",
+    },
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Copilot Token 交换失败 (HTTP ${resp.status}): ${body}\n提示: 你的 PAT 需要有 copilot scope，且账号需要有 Copilot 订阅`);
+  }
+
+  const data = await resp.json() as any;
+  cachedCopilotToken = data.token;
+  copilotTokenExpiry = data.expires_at;
+  const expiresAt = new Date(data.expires_at * 1000);
+  console.log(`[Copilot] ✅ Token 获取成功，有效期至 ${expiresAt.toLocaleString("zh-CN")}`);
+
+  // 设置环境变量供 pi-ai 使用
+  process.env.COPILOT_GITHUB_TOKEN = cachedCopilotToken;
+
+  return cachedCopilotToken;
+}
 
 // ============================================================
 // 配置
@@ -97,14 +144,17 @@ export class SkillAgent {
       }
     });
 
-    // 2. 获取 LLM 模型
+    // 2. 交换 Copilot Token
+    await exchangeCopilotToken();
+
+    // 3. 获取 LLM 模型
     const model = getModel(this.config.provider, this.config.model);
     console.log(`[SkillAgent] 使用模型: ${model.provider}/${model.id}`);
 
-    // 3. 将 Skills 转为 AgentTool
+    // 4. 将 Skills 转为 AgentTool
     const tools = this.skills.map(skill => skill.tool);
 
-    // 4. 创建 Agent
+    // 5. 创建 Agent（getApiKey 自动刷新 Copilot Token）
     this.agent = new Agent({
       initialState: {
         systemPrompt: this.config.systemPrompt,
@@ -113,27 +163,47 @@ export class SkillAgent {
         thinkingLevel: this.config.thinkingLevel,
       },
       streamFn: streamSimple,
+      getApiKey: async (provider: string) => {
+        if (provider === "github-copilot") {
+          return await exchangeCopilotToken();
+        }
+        return getEnvApiKey(provider);
+      },
     });
 
-    // 5. 订阅事件
+    // 6. 订阅事件
     this.agent.subscribe((event) => {
       switch (event.type) {
         case "agent_start":
           console.log("[Agent] 开始处理");
           break;
+        case "message_update": {
+          const e = event as any;
+          if (e.assistantMessageEvent?.type === "text_delta") {
+            process.stdout.write(e.assistantMessageEvent.delta);
+          }
+          break;
+        }
         case "tool_execution_start":
-          console.log(`[Tool] 执行: ${event.toolName}(${JSON.stringify(event.args)})`);
+          console.log(`\n[Tool] 执行: ${event.toolName}(${JSON.stringify(event.args)})`);
           break;
         case "tool_execution_end":
           console.log(`[Tool] 完成: ${event.isError ? "❌ 失败" : "✅ 成功"}`);
           break;
+        case "message_end": {
+          const e = event as any;
+          if (e.message?.stopReason === "error") {
+            console.error(`\n❌ LLM 错误: ${e.message.errorMessage || "未知错误"}`);
+          }
+          break;
+        }
         case "agent_end":
-          console.log("[Agent] 处理完成");
+          console.log("\n[Agent] 处理完成");
           break;
       }
     });
 
-    // 6. 注册定时任务
+    // 7. 注册定时任务
     this.skills.forEach(skill => {
       if (skill.schedule) {
         this.scheduler.addJob(skill.name, skill.schedule, async () => {
@@ -156,9 +226,9 @@ export class SkillAgent {
     let result = "";
     this.agent.subscribe((event) => {
       if (event.type === "message_update") {
-        const msg = (event as any).assistantMessageEvent;
-        if (msg?.type === "text_delta") {
-          result += msg.delta;
+        const e = event as any;
+        if (e.assistantMessageEvent?.type === "text_delta") {
+          result += e.assistantMessageEvent.delta;
         }
       }
     });
@@ -328,11 +398,13 @@ Skill Agent - 基于 pi + GitHub Copilot 的智能运维 Agent
     }
   }
 
-  // 检查 Copilot Token
+  // 检查 Token
   const token = process.env.COPILOT_GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
   if (!token) {
-    console.warn("[SkillAgent] ⚠️ 未检测到 GitHub Copilot Token");
-    console.warn("  请设置环境变量: COPILOT_GITHUB_TOKEN=gho_xxxx");
+    console.warn("[SkillAgent] ⚠️ 未检测到 GitHub Token");
+    console.warn("  请设置环境变量（支持 gho_/ghp_/ghu_ 格式）:");
+    console.warn("    GH_TOKEN=ghp_xxxx          (GitHub PAT，需 copilot scope)");
+    console.warn("    COPILOT_GITHUB_TOKEN=gho_xxxx (Copilot OAuth Token)");
     console.warn("  或创建 .env 文件: cp .env.example .env && vi .env");
     console.warn("");
     console.warn("  仅 --list / --list-models 模式可无 Token 运行");
@@ -340,7 +412,8 @@ Skill Agent - 基于 pi + GitHub Copilot 的智能运维 Agent
       process.exit(1);
     }
   } else {
-    console.log(`[SkillAgent] GitHub Copilot Token: ${token.substring(0, 8)}...${token.substring(token.length - 4)}`);
+    const prefix = token.substring(0, 4);
+    console.log(`[SkillAgent] GitHub Token: ${prefix}...${token.substring(token.length - 4)} (${prefix === "gho_" ? "Copilot OAuth" : prefix === "ghp_" ? "PAT (自动交换)" : "其他"})`);
   }
 
   // 创建 Agent
