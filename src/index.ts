@@ -35,33 +35,40 @@ function loadDotEnv(): void {
 loadDotEnv();
 
 // ============================================================
-// Copilot Token 交换：PAT → Copilot OAuth Token
+// Copilot Token 管理：gho_ token → 短期 API token + 定时刷新
 // ============================================================
-let cachedCopilotToken: string | null = null;
-let copilotTokenExpiry = 0;
 
-async function exchangeCopilotToken(): Promise<string> {
-  // 如果已有有效 token，直接返回
+/** .env 中存的是 gho_ 开头的 OAuth token（长期有效，由 login.ts 获取） */
+let oauthToken: string = "";        // gho_ token，用于刷新 API token
+let cachedApiToken: string | null = null;  // 短期 API token（约 30 分钟有效）
+let apiTokenExpiry = 0;             // API token 过期时间（unix 秒）
+let refreshTimer: ReturnType<typeof setInterval> | null = null;
+
+const REFRESH_INTERVAL_MS = 25 * 60 * 1000; // 每 25 分钟刷新一次
+
+/** 用 gho_ OAuth token 换取短期 Copilot API token */
+async function refreshApiToken(): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
-  if (cachedCopilotToken && copilotTokenExpiry > now + 60) {
-    return cachedCopilotToken;
+
+  // 缓存未过期，直接返回
+  if (cachedApiToken && apiTokenExpiry > now + 60) {
+    return cachedApiToken;
   }
 
-  // 获取 PAT / GitHub Token
-  const pat = process.env.GH_TOKEN || process.env.GITHUB_TOKEN || process.env.COPILOT_GITHUB_TOKEN;
-  if (!pat) throw new Error("未设置 GitHub Token");
-
-  // 如果已经是 gho_ 开头（Copilot OAuth Token），直接使用
-  if (pat.startsWith("gho_")) {
-    cachedCopilotToken = pat;
-    return pat;
+  if (!oauthToken) {
+    // 从环境变量获取 gho_ token
+    oauthToken = process.env.COPILOT_GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_TOKEN || "";
   }
 
-  // 用 PAT 换取 Copilot OAuth Token
-  console.log("[Copilot] 正在用 GitHub PAT 换取 Copilot OAuth Token...");
+  if (!oauthToken) {
+    throw new Error("未设置 GitHub Token，请先运行: npx tsx src/login.ts");
+  }
+
+  // gho_ token 不能直接调 Copilot API，需要换取 API token
+  console.log("[Copilot] 正在刷新 API Token...");
   const resp = await fetch("https://api.github.com/copilot_internal/v2/token", {
     headers: {
-      "Authorization": `token ${pat}`,
+      "Authorization": `token ${oauthToken}`,
       "Accept": "application/json",
       "User-Agent": "skill-agent",
     },
@@ -69,19 +76,52 @@ async function exchangeCopilotToken(): Promise<string> {
 
   if (!resp.ok) {
     const body = await resp.text();
-    throw new Error(`Copilot Token 交换失败 (HTTP ${resp.status}): ${body}\n提示: 你的 PAT 需要有 copilot scope，且账号需要有 Copilot 订阅`);
+    // 如果 gho_ token 也过期了，提示重新登录
+    if (resp.status === 401 || resp.status === 403 || resp.status === 404) {
+      throw new Error(
+        `Copilot Token 刷新失败 (HTTP ${resp.status})\n` +
+        `  OAuth Token 可能已过期，请重新运行: npx tsx src/login.ts\n` +
+        `  原因: ${body}`
+      );
+    }
+    throw new Error(`Copilot Token 刷新失败 (HTTP ${resp.status}): ${body}`);
   }
 
   const data = await resp.json() as any;
-  cachedCopilotToken = data.token;
-  copilotTokenExpiry = data.expires_at;
+  cachedApiToken = data.token;
+  apiTokenExpiry = data.expires_at;
   const expiresAt = new Date(data.expires_at * 1000);
-  console.log(`[Copilot] ✅ Token 获取成功，有效期至 ${expiresAt.toLocaleString("zh-CN")}`);
+  console.log(`[Copilot] ✅ API Token 刷新成功，有效期至 ${expiresAt.toLocaleString("zh-CN")}`);
 
-  // 设置环境变量供 pi-ai 使用
-  process.env.COPILOT_GITHUB_TOKEN = cachedCopilotToken;
+  // 更新环境变量供 pi-ai 内部使用
+  process.env.COPILOT_GITHUB_TOKEN = cachedApiToken!;
 
-  return cachedCopilotToken;
+  return cachedApiToken!;
+}
+
+/** 启动定时刷新（每 25 分钟） */
+function startTokenRefresh(): void {
+  if (refreshTimer) return; // 已启动
+
+  refreshTimer = setInterval(async () => {
+    try {
+      await refreshApiToken();
+    } catch (err) {
+      console.error(`[Copilot] 定时刷新失败: ${err instanceof Error ? err.message : err}`);
+    }
+  }, REFRESH_INTERVAL_MS);
+
+  // 不阻止进程退出
+  if (refreshTimer.unref) refreshTimer.unref();
+  console.log(`[Copilot] 定时刷新已启动 (每 ${REFRESH_INTERVAL_MS / 60000} 分钟)`);
+}
+
+/** 停止定时刷新 */
+function stopTokenRefresh(): void {
+  if (refreshTimer) {
+    clearInterval(refreshTimer);
+    refreshTimer = null;
+  }
 }
 
 // ============================================================
@@ -144,8 +184,9 @@ export class SkillAgent {
       }
     });
 
-    // 2. 交换 Copilot Token
-    await exchangeCopilotToken();
+    // 2. 刷新 Copilot API Token
+    await refreshApiToken();
+    startTokenRefresh();
 
     // 3. 获取 LLM 模型
     const model = getModel(this.config.provider, this.config.model);
@@ -165,7 +206,7 @@ export class SkillAgent {
       streamFn: streamSimple,
       getApiKey: async (provider: string) => {
         if (provider === "github-copilot") {
-          return await exchangeCopilotToken();
+          return await refreshApiToken();
         }
         return getEnvApiKey(provider);
       },
@@ -402,10 +443,8 @@ Skill Agent - 基于 pi + GitHub Copilot 的智能运维 Agent
   const token = process.env.COPILOT_GITHUB_TOKEN || process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
   if (!token) {
     console.warn("[SkillAgent] ⚠️ 未检测到 GitHub Token");
-    console.warn("  请设置环境变量（支持 gho_/ghp_/ghu_ 格式）:");
-    console.warn("    GH_TOKEN=ghp_xxxx          (GitHub PAT，需 copilot scope)");
-    console.warn("    COPILOT_GITHUB_TOKEN=gho_xxxx (Copilot OAuth Token)");
-    console.warn("  或创建 .env 文件: cp .env.example .env && vi .env");
+    console.warn("  请先运行登录工具获取 Copilot OAuth Token:");
+    console.warn("    npx tsx src/login.ts");
     console.warn("");
     console.warn("  仅 --list / --list-models 模式可无 Token 运行");
     if (mode !== "list" && mode !== "list-models") {
@@ -413,7 +452,8 @@ Skill Agent - 基于 pi + GitHub Copilot 的智能运维 Agent
     }
   } else {
     const prefix = token.substring(0, 4);
-    console.log(`[SkillAgent] GitHub Token: ${prefix}...${token.substring(token.length - 4)} (${prefix === "gho_" ? "Copilot OAuth" : prefix === "ghp_" ? "PAT (自动交换)" : "其他"})`);
+    const typeLabel = prefix === "gho_" ? "Copilot OAuth ✅" : prefix === "ghp_" ? "PAT (建议换 gho_ token)" : "未知类型";
+    console.log(`[SkillAgent] GitHub Token: ${prefix}...${token.substring(token.length - 4)} (${typeLabel})`);
   }
 
   // 创建 Agent
