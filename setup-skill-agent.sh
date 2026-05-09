@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# Skill Agent 一键安装脚本 (源码版)
+# Skill Agent 一键安装脚本
 # 适用: Linux 服务器，需能访问外网 (npm install)
 # 用法: bash setup-skill-agent.sh [/opt/skill-agent]
 # ============================================================
@@ -52,7 +52,6 @@ cat > "${INSTALL_DIR}/package.json" << 'PKGJSON'
     "@mariozechner/pi-agent-core": "^0.73.1",
     "@mariozechner/pi-ai": "^0.73.1",
     "chalk": "^5.6.2",
-    "js-yaml": "^4.1.1",
     "node-cron": "^4.2.1"
   },
   "devDependencies": {
@@ -94,7 +93,7 @@ cat > "${INSTALL_DIR}/.env.example" << 'ENVEGX'
 
 # --- GitHub Copilot Token (必填) ---
 # 获取方式:
-#   方式1: gh auth token          (需要 GitHub CLI)
+#   方式1: VS Code Copilot 扩展 → Ctrl+Shift+P → Copilot: Show Copilot Token
 #   方式2: https://github.com/settings/tokens → Generate new token (classic) → copilot scope
 # 优先级: COPILOT_GITHUB_TOKEN > GH_TOKEN > GITHUB_TOKEN
 COPILOT_GITHUB_TOKEN=gho_xxxx
@@ -121,7 +120,7 @@ cat > "${INSTALL_DIR}/src/index.ts" << 'INDEXTS'
  * Skill Agent - 基于 pi-agent-core + GitHub Copilot 的智能运维 Agent
  *
  * 核心功能：
- * 1. 加载 skills/ 目录下的 Skill（SKILL.md + skill.yaml + scripts/）
+ * 1. 加载 skills/ 目录下的 Skill（SKILL.md + scripts/）
  * 2. 将 Skill 注册为 pi AgentTool
  * 3. 通过 node-cron 实现定时调度
  * 4. 使用 GitHub Copilot 订阅作为 LLM 提供商
@@ -365,6 +364,10 @@ Skill Agent - 基于 pi + GitHub Copilot 的智能运维 Agent
   GH_TOKEN                 GitHub CLI token
   GITHUB_TOKEN             GitHub token (优先级最低)
 
+Skill 规范 (agentskills.io):
+  skills/<name>/SKILL.md   # YAML frontmatter (元数据) + Markdown (技能描述)
+  skills/<name>/scripts/   # bash 或 python3 脚本
+
 示例:
   skill-agent                        # 交互式 REPL
   skill-agent --list-models          # 列出可用模型
@@ -395,6 +398,12 @@ Skill Agent - 基于 pi + GitHub Copilot 的智能运维 Agent
       agent.listSkills().forEach(s => {
         console.log(`  ${s.name} - ${s.description}`);
         if (s.schedule) console.log(`    定时: ${s.schedule}`);
+        if (s.parameters) {
+          const params = s.parameters as Record<string, Record<string, string>>;
+          Object.entries(params).forEach(([k, v]) => {
+            console.log(`    参数: ${k} (${v.type || "string"}) - ${v.description || ""}`);
+          });
+        }
       });
       break;
     }
@@ -420,12 +429,13 @@ INDEXTS
 # --- src/skill-loader.ts ---
 cat > "${INSTALL_DIR}/src/skill-loader.ts" << 'SKILLLOADER'
 /**
- * Skill Loader - 扫描 skills/ 目录，解析 SKILL.md + skill.yaml，注册为 pi AgentTool
+ * Skill Loader - 扫描 skills/ 目录，解析 SKILL.md（frontmatter + 正文），注册为 pi AgentTool
+ *
+ * 符合 agentskills.io 规范：一个 SKILL.md 文件搞定所有元数据和描述
  *
  * Skill 目录规范:
  *   skills/<skill-name>/
- *   ├── SKILL.md        # agentskills.io 标准格式的技能描述
- *   ├── skill.yaml      # 元数据：参数定义、调度规则、配置
+ *   ├── SKILL.md        # agentskills.io 标准：YAML frontmatter (元数据) + Markdown (技能描述)
  *   └── scripts/
  *       ├── run.sh      # Shell 脚本入口
  *       └── run.py      # Python 脚本入口
@@ -433,11 +443,13 @@ cat > "${INSTALL_DIR}/src/skill-loader.ts" << 'SKILLLOADER'
 
 import { readFileSync, readdirSync, statSync, existsSync } from "fs";
 import { join } from "path";
-import { load as loadYaml } from "js-yaml";
 import { execFile } from "child_process";
 import { Type } from "@mariozechner/pi-ai";
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 
+// ============================================================
+// 类型定义
+// ============================================================
 export interface SkillParameter {
   type: "string" | "number" | "boolean";
   description?: string;
@@ -446,10 +458,10 @@ export interface SkillParameter {
   enum?: string[];
 }
 
-export interface SkillYaml {
+export interface SkillFrontmatter {
   name: string;
   version?: string;
-  description: string;
+  description?: string;
   schedule?: string;
   executor?: "bash" | "python3";
   entry?: string;
@@ -463,22 +475,88 @@ export interface SkillDefinition {
   description: string;
   schedule?: string;
   parameters?: Record<string, SkillParameter>;
-  skillYaml: SkillYaml;
+  frontmatter: SkillFrontmatter;
   skillMd: string;
   dir: string;
   tool: AgentTool;
 }
 
-function parseSkillMd(filePath: string): string {
-  if (!existsSync(filePath)) return "";
-  return readFileSync(filePath, "utf-8");
+// ============================================================
+// Frontmatter 解析（轻量 YAML，无需 js-yaml 依赖）
+// ============================================================
+
+function parseFrontmatter(content: string): { frontmatter: Record<string, unknown>; body: string } {
+  const match = content.match(/^---\s*\n([\s\S]*?)\n---\s*\n([\s\S]*)$/);
+  if (!match) return { frontmatter: {}, body: content };
+  return { frontmatter: parseYaml(match[1]), body: match[2] };
 }
 
-function parseSkillYaml(filePath: string): SkillYaml | null {
+function parseYaml(input: string): Record<string, unknown> {
+  const lines = input.split("\n");
+  return parseYamlLines(lines, 0, lines.length).result;
+}
+
+function parseYamlLines(lines: string[], start: number, end: number): { result: Record<string, unknown>; nextLine: number } {
+  const result: Record<string, unknown> = {};
+  let i = start;
+
+  while (i < end) {
+    const line = lines[i];
+    if (line.trim() === "" || line.trimStart().startsWith("#")) { i++; continue; }
+
+    const indent = line.length - line.trimStart().length;
+    const trimmed = line.trimStart();
+
+    const kvMatch = trimmed.match(/^(\w[\w-]*):\s*(.*)$/);
+    if (!kvMatch) { i++; continue; }
+
+    const key = kvMatch[1];
+    const val = kvMatch[2].trim();
+
+    if (val === "" || val === "|" || val === ">") {
+      const nextLine = i + 1;
+      if (nextLine < end) {
+        const nextIndent = lines[nextLine].length - lines[nextLine].trimStart().length;
+        if (nextIndent > indent) {
+          const nested = parseYamlLines(lines, nextLine, end);
+          result[key] = nested.result;
+          i = nested.nextLine;
+          continue;
+        }
+      }
+      result[key] = "";
+      i++;
+      continue;
+    }
+
+    result[key] = parseYamlValue(val);
+    i++;
+  }
+
+  return { result, nextLine: i };
+}
+
+function parseYamlValue(val: string): unknown {
+  if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'")))
+    return val.slice(1, -1);
+  if (val === "true") return true;
+  if (val === "false") return false;
+  if (/^-?\d+(\.\d+)?$/.test(val)) return Number(val);
+  if (val.startsWith("[") && val.endsWith("]"))
+    return val.slice(1, -1).split(",").map(s => parseYamlValue(s.trim()));
+  return val;
+}
+
+// ============================================================
+// Skill 加载
+// ============================================================
+
+function parseSkillMd(filePath: string): { frontmatter: SkillFrontmatter; body: string } | null {
   if (!existsSync(filePath)) return null;
   try {
     const content = readFileSync(filePath, "utf-8");
-    return loadYaml(content) as SkillYaml;
+    const { frontmatter, body } = parseFrontmatter(content);
+    return { frontmatter: frontmatter as unknown as SkillFrontmatter, body };
   } catch (err) {
     console.error(`[SkillLoader] 解析 ${filePath} 失败:`, err);
     return null;
@@ -510,13 +588,13 @@ function buildParametersSchema(params: Record<string, SkillParameter> | undefine
 
 function executeSkillScript(
   skillDir: string,
-  skillYaml: SkillYaml,
+  frontmatter: SkillFrontmatter,
   params: Record<string, unknown>,
   signal?: AbortSignal
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve, reject) => {
-    const executor = skillYaml.executor || "bash";
-    const entry = skillYaml.entry || (executor === "python3" ? "scripts/run.py" : "scripts/run.sh");
+    const executor = frontmatter.executor || "bash";
+    const entry = frontmatter.entry || (executor === "python3" ? "scripts/run.py" : "scripts/run.sh");
     const scriptPath = join(skillDir, entry);
 
     if (!existsSync(scriptPath)) {
@@ -528,14 +606,14 @@ function executeSkillScript(
       ...process.env as Record<string, string>,
       SKILL_ARGS: JSON.stringify(params),
       SKILL_DIR: skillDir,
-      SKILL_NAME: skillYaml.name,
+      SKILL_NAME: frontmatter.name,
     };
 
-    if (skillYaml.env) {
-      Object.entries(skillYaml.env).forEach(([k, v]) => { env[k] = v; });
+    if (frontmatter.env) {
+      Object.entries(frontmatter.env).forEach(([k, v]) => { env[k] = v; });
     }
 
-    const timeout = skillYaml.timeout || 60000;
+    const timeout = frontmatter.timeout || 60000;
 
     const child = execFile(
       executor, [scriptPath],
@@ -554,31 +632,31 @@ function executeSkillScript(
   });
 }
 
-function createSkillTool(skillDir: string, skillYaml: SkillYaml, skillMd: string): AgentTool {
-  const parametersSchema = buildParametersSchema(skillYaml.parameters);
-  const description = `${skillYaml.description}\n\nSchedule: ${skillYaml.schedule || "手动触发"}\nExecutor: ${skillYaml.executor || "bash"}`;
+function createSkillTool(skillDir: string, frontmatter: SkillFrontmatter, skillMdBody: string): AgentTool {
+  const parametersSchema = buildParametersSchema(frontmatter.parameters);
+  const description = `${frontmatter.description || skillMdBody.split("\n")[0] || frontmatter.name}\n\nSchedule: ${frontmatter.schedule || "手动触发"}\nExecutor: ${frontmatter.executor || "bash"}`;
 
   return {
-    name: skillYaml.name,
-    label: skillYaml.name,
+    name: frontmatter.name,
+    label: frontmatter.name,
     description,
     parameters: parametersSchema,
     execute: async (toolCallId, params, signal, onUpdate) => {
       try {
-        onUpdate?.({ type: "progress", message: `正在执行 Skill: ${skillYaml.name}...` });
-        const result = await executeSkillScript(skillDir, skillYaml, params as Record<string, unknown>, signal);
+        onUpdate?.({ type: "progress", message: `正在执行 Skill: ${frontmatter.name}...` });
+        const result = await executeSkillScript(skillDir, frontmatter, params as Record<string, unknown>, signal);
         const output = result.stderr
           ? `--- stdout ---\n${result.stdout}\n--- stderr ---\n${result.stderr}`
           : result.stdout;
         return {
           content: [{ type: "text" as const, text: output }],
-          details: { exitCode: result.exitCode, skill: skillYaml.name },
+          details: { exitCode: result.exitCode, skill: frontmatter.name },
         };
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text" as const, text: `Skill 执行失败: ${errorMsg}` }],
-          details: { error: true, skill: skillYaml.name },
+          details: { error: true, skill: frontmatter.name },
         };
       }
     },
@@ -599,24 +677,26 @@ export async function loadSkills(skillsDir: string): Promise<SkillDefinition[]> 
     const skillPath = join(skillsDir, entry);
     if (!statSync(skillPath).isDirectory()) continue;
 
-    const yamlPath = join(skillPath, "skill.yaml");
-    const skillYaml = parseSkillYaml(yamlPath);
+    const mdPath = join(skillPath, "SKILL.md");
+    const parsed = parseSkillMd(mdPath);
 
-    if (!skillYaml) {
-      console.warn(`[SkillLoader] 跳过 ${entry}: 缺少 skill.yaml`);
+    if (!parsed || !parsed.frontmatter.name) {
+      console.warn(`[SkillLoader] 跳过 ${entry}: 缺少 SKILL.md 或 frontmatter 中无 name`);
       continue;
     }
 
-    const mdPath = join(skillPath, "SKILL.md");
-    const skillMd = parseSkillMd(mdPath);
-    const tool = createSkillTool(skillPath, skillYaml, skillMd);
+    const { frontmatter, body } = parsed;
+    const tool = createSkillTool(skillPath, frontmatter, body);
 
     skills.push({
-      name: skillYaml.name,
-      description: skillYaml.description,
-      schedule: skillYaml.schedule,
-      parameters: skillYaml.parameters,
-      skillYaml, skillMd, dir: skillPath, tool,
+      name: frontmatter.name,
+      description: frontmatter.description || body.split("\n").find(l => l.trim())?.replace(/^#+\s*/, "") || frontmatter.name,
+      schedule: frontmatter.schedule,
+      parameters: frontmatter.parameters,
+      frontmatter,
+      skillMd: body,
+      dir: skillPath,
+      tool,
     });
   }
 
@@ -694,8 +774,9 @@ export class Scheduler {
 }
 SCHEDTS
 
-# --- Skill: hello ---
-cat > "${INSTALL_DIR}/skills/hello/skill.yaml" << 'HELLOYAML'
+# --- Skill: hello (SKILL.md + scripts) ---
+cat > "${INSTALL_DIR}/skills/hello/SKILL.md" << 'HELLOMD'
+---
 name: hello
 version: "1.0"
 description: "Agent 健康检查 - 输出系统信息和参数，验证 Skill 运行正常"
@@ -708,9 +789,8 @@ parameters:
     description: "问候语"
     default: "Hello from Skill Agent!"
     required: false
-HELLOYAML
+---
 
-cat > "${INSTALL_DIR}/skills/hello/SKILL.md" << 'HELLOMD'
 # Hello Skill
 
 用于验证 Skill Agent 基础功能的测试技能。
@@ -755,7 +835,8 @@ HELLOSH
 chmod +x "${INSTALL_DIR}/skills/hello/scripts/run.sh"
 
 # --- Skill: harbor-check ---
-cat > "${INSTALL_DIR}/skills/harbor-check/skill.yaml" << 'HARBORYAML'
+cat > "${INSTALL_DIR}/skills/harbor-check/SKILL.md" << 'HARBORMD'
+---
 name: harbor-check
 version: "1.0"
 description: "Harbor V1.8 仓库巡检 - 检查 API 可达性、存储使用、项目统计"
@@ -775,9 +856,8 @@ parameters:
     default: false
 env:
   HARBOR_URL: "https://xcloud.lenovo.com/api/v2.0"
-HARBORYAML
+---
 
-cat > "${INSTALL_DIR}/skills/harbor-check/SKILL.md" << 'HARBORMD'
 # Harbor 仓库巡检 Skill
 
 检查 Harbor V1.8 镜像仓库的健康状态和资源使用情况。
@@ -851,7 +931,8 @@ HARBORSH
 chmod +x "${INSTALL_DIR}/skills/harbor-check/scripts/run.sh"
 
 # --- Skill: system-info ---
-cat > "${INSTALL_DIR}/skills/system-info/skill.yaml" << 'SYSINFOYAML'
+cat > "${INSTALL_DIR}/skills/system-info/SKILL.md" << 'SYSINFOMD'
+---
 name: system-info
 version: "1.0"
 description: "系统信息采集 - 收集 CPU/内存/磁盘/进程状态"
@@ -868,9 +949,8 @@ parameters:
     type: number
     description: "磁盘告警阈值(%)"
     default: 80
-SYSINFOYAML
+---
 
-cat > "${INSTALL_DIR}/skills/system-info/SKILL.md" << 'SYSINFOMD'
 # 系统信息 Skill
 
 收集当前运行环境的系统信息，用于运维监控和故障排查。

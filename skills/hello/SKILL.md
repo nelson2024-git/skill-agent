@@ -1,3 +1,18 @@
+---
+name: hello
+version: "1.0"
+description: "Agent 健康检查 - 输出系统信息和参数，验证 Skill 运行正常"
+executor: bash
+entry: scripts/run.sh
+timeout: 10000
+parameters:
+  greeting:
+    type: string
+    description: "问候语"
+    default: "Hello from Skill Agent!"
+    required: false
+---
+
 # Hello Skill
 
 用于验证 Skill Agent 基础功能的测试技能。

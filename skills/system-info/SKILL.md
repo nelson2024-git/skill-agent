@@ -1,3 +1,22 @@
+---
+name: system-info
+version: "1.0"
+description: "系统信息采集 - 收集 CPU/内存/磁盘/进程状态"
+schedule: "*/30 * * * *"
+executor: bash
+entry: scripts/run.sh
+timeout: 15000
+parameters:
+  check_disk:
+    type: boolean
+    description: "是否检查磁盘使用详情"
+    default: true
+  disk_threshold:
+    type: number
+    description: "磁盘告警阈值(%)"
+    default: 80
+---
+
 # 系统信息 Skill
 
 收集当前运行环境的系统信息，用于运维监控和故障排查。

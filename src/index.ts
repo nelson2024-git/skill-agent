@@ -2,7 +2,7 @@
  * Skill Agent - 基于 pi-agent-core + GitHub Copilot 的智能运维 Agent
  * 
  * 核心功能：
- * 1. 加载 skills/ 目录下的 Skill（SKILL.md + skill.yaml + scripts/）
+ * 1. 加载 skills/ 目录下的 Skill（SKILL.md + scripts/）
  * 2. 将 Skill 注册为 pi AgentTool
  * 3. 通过 node-cron 实现定时调度
  * 4. 使用 GitHub Copilot 订阅作为 LLM 提供商

@@ -1,3 +1,25 @@
+---
+name: harbor-check
+version: "1.0"
+description: "Harbor V1.8 仓库巡检 - 检查 API 可达性、存储使用、项目统计"
+schedule: "0 9 * * 1-5"
+executor: bash
+entry: scripts/run.sh
+timeout: 30000
+parameters:
+  harbor_url:
+    type: string
+    description: "Harbor API 地址"
+    default: "https://xcloud.lenovo.com/api/v2.0"
+    required: true
+  check_projects:
+    type: boolean
+    description: "是否检查项目详情"
+    default: false
+env:
+  HARBOR_URL: "https://xcloud.lenovo.com/api/v2.0"
+---
+
 # Harbor 仓库巡检 Skill
 
 检查 Harbor V1.8 镜像仓库的健康状态和资源使用情况。
