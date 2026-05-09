@@ -157,6 +157,18 @@ const DEFAULT_CONFIG: AgentConfig = {
 };
 
 // ============================================================
+// HTTP 辅助
+// ============================================================
+function readRequestBody(req: any): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk: string) => { data += chunk; });
+    req.on("end", () => resolve(data));
+    req.on("error", reject);
+  });
+}
+
+// ============================================================
 // Agent 运行时
 // ============================================================
 export class SkillAgent {
@@ -309,6 +321,92 @@ export class SkillAgent {
     console.log("[Scheduler] 定时调度已停止");
   }
 
+  /** 启动 HTTP API 服务（用于 systemd 后台模式下的远程交互） */
+  async startApiServer(port: number = 38080): Promise<void> {
+    const http = await import("http");
+
+    const server = http.createServer(async (req, res) => {
+      // CORS
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+      if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+
+      const url = new URL(req.url || "/", `http://localhost:${port}`);
+
+      try {
+        // GET / — 状态页
+        if (req.method === "GET" && url.pathname === "/") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            status: "running",
+            skills: this.skills.map(s => ({ name: s.name, description: s.description, schedule: s.schedule || null })),
+            schedules: this.listSchedules(),
+          }));
+          return;
+        }
+
+        // GET /skills — 列出 Skills
+        if (req.method === "GET" && url.pathname === "/skills") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(this.skills.map(s => ({
+            name: s.name, description: s.description, schedule: s.schedule || null,
+            parameters: s.parameters,
+          }))));
+          return;
+        }
+
+        // POST /chat — 与 Agent 对话
+        if (req.method === "POST" && url.pathname === "/chat") {
+          const body = await readRequestBody(req);
+          const { message } = JSON.parse(body);
+          if (!message) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "缺少 message 字段" }));
+            return;
+          }
+          console.log(`[API] 收到消息: ${message}`);
+          const result = await this.runPrompt(message);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ reply: result }));
+          return;
+        }
+
+        // POST /run — 运行指定 Skill
+        if (req.method === "POST" && url.pathname === "/run") {
+          const body = await readRequestBody(req);
+          const { skill, args } = JSON.parse(body);
+          if (!skill) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "缺少 skill 字段" }));
+            return;
+          }
+          console.log(`[API] 运行 Skill: ${skill}`);
+          const result = await this.runSkill(skill, args);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ reply: result }));
+          return;
+        }
+
+        // 404
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Not Found" }));
+      } catch (err) {
+        console.error(`[API] 错误:`, err);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
+      }
+    });
+
+    server.listen(port, () => {
+      console.log(`[API] HTTP 服务已启动: http://localhost:${port}`);
+      console.log(`[API]   GET  /         — 状态信息`);
+      console.log(`[API]   GET  /skills   — 列出 Skills`);
+      console.log(`[API]   POST /chat     — 与 Agent 对话 {"message":"你好"}`);
+      console.log(`[API]   POST /run      — 运行 Skill {"skill":"harbor-check"}`);
+    });
+  }
+
   /** 交互式 REPL */
   async repl() {
     const readline = await import("readline");
@@ -374,8 +472,9 @@ async function main() {
 
   // 解析命令行参数
   const config: Partial<AgentConfig> = {};
-  let mode: "repl" | "list" | "run" = "repl";
+  let mode: "repl" | "list" | "run" | "serve" = "repl";
   let runSkillName = "";
+  let apiPort = parseInt(process.env.SKILL_AGENT_PORT || "38080", 10);
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -395,6 +494,12 @@ async function main() {
         mode = "run";
         runSkillName = args[++i];
         break;
+      case "--serve":
+        mode = "serve";
+        break;
+      case "--port":
+        apiPort = parseInt(args[++i], 10);
+        break;
       case "--list-models": {
         registerBuiltInApiProviders();
         const models = getModels("github-copilot");
@@ -408,13 +513,15 @@ Skill Agent - 基于 pi + GitHub Copilot 的智能运维 Agent
 
 用法: skill-agent [选项]
 
-选项:
+  选项:
   --provider <provider>    LLM 提供商 (默认: github-copilot)
   --model <model>          模型 ID (默认: gpt-4.1)
   --skills-dir <path>      Skills 目录 (默认: ./skills)
   --list                   列出所有 Skills 并退出
   --list-models            列出 GitHub Copilot 可用模型并退出
   --run <skill-name>       运行指定 Skill 并退出
+  --serve                  启动 HTTP API 服务 (后台模式)
+  --port <port>            HTTP 端口 (默认: 38080)
   --help                   显示帮助
 
 环境变量:
@@ -481,10 +588,18 @@ Skill Agent - 基于 pi + GitHub Copilot 的智能运维 Agent
       break;
     }
     case "repl": {
-      // 启动定时调度
       agent.startScheduler();
-      // 进入交互模式
+      await agent.startApiServer(apiPort); // REPL 模式也开 API
       await agent.repl();
+      break;
+    }
+    case "serve": {
+      agent.startScheduler();
+      await agent.startApiServer(apiPort);
+      console.log("[SkillAgent] 后台服务模式，通过 HTTP API 交互");
+      // 保持进程运行
+      process.on("SIGTERM", () => { agent.stopScheduler(); stopTokenRefresh(); process.exit(0); });
+      process.on("SIGINT", () => { agent.stopScheduler(); stopTokenRefresh(); process.exit(0); });
       break;
     }
   }
