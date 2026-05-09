@@ -155,8 +155,11 @@ export class SkillAgent {
 
     let result = "";
     this.agent.subscribe((event) => {
-      if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-        result += event.assistantMessageEvent.delta;
+      if (event.type === "message_update") {
+        const msg = (event as any).assistantMessageEvent;
+        if (msg?.type === "text_delta") {
+          result += msg.delta;
+        }
       }
     });
 
