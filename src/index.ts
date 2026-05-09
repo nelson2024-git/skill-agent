@@ -196,9 +196,15 @@ export class SkillAgent {
       }
     });
 
-    // 2. 刷新 Copilot API Token
-    await refreshApiToken();
-    startTokenRefresh();
+    // 2. 尝试刷新 Copilot API Token（失败不阻塞启动）
+    try {
+      await refreshApiToken();
+      startTokenRefresh();
+    } catch (err) {
+      console.warn(`[Copilot] ⚠️ Token 刷新失败: ${err instanceof Error ? err.message : err}`);
+      console.warn("[Copilot] API 服务已启动，但聊天功能暂不可用");
+      console.warn("[Copilot] 请运行 npx tsx src/login.ts 重新获取 Token");
+    }
 
     // 3. 获取 LLM 模型
     const model = getModel(this.config.provider, this.config.model);
